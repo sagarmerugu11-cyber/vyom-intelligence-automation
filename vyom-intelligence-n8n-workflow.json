@@ -1,0 +1,360 @@
+{
+  "name": "Vyom Intelligence — Free Audit Lead Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vyom-audit-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "1. Webhook — Receive Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "notes": "Paste this webhook URL into your audit form's action. Receives: name, company, email, phone, url, challenge"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"status\": \"received\", \"message\": \"Thank you! Your audit report will arrive within 24 hours.\" }",
+        "options": {}
+      },
+      "id": "node-respond",
+      "name": "2. Respond to Form",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [460, 180],
+      "notes": "Immediately respond 200 OK so the form doesn't hang"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 3: Clean & Validate Lead Data ──────────────────\nconst body = $input.first().json.body || $input.first().json;\n\n// Normalise URL\nlet rawUrl = (body.url || body.website || '').trim();\nif (rawUrl && !rawUrl.startsWith('http')) rawUrl = 'https://' + rawUrl;\n\nlet hostname = '';\ntry { hostname = new URL(rawUrl).hostname.replace('www.', ''); } catch(e) {}\n\n// Clean fields\nconst lead = {\n  name:      (body.name || '').trim(),\n  company:   (body.company || '').trim(),\n  email:     (body.email || '').trim().toLowerCase(),\n  phone:     (body.phone || '').trim(),\n  url:       rawUrl,\n  hostname:  hostname,\n  challenge: (body.challenge || 'Not specified').trim(),\n  submitted: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),\n  timestamp: new Date().toISOString()\n};\n\n// Basic validation\nif (!lead.email || !lead.email.includes('@')) {\n  throw new Error('Invalid email: ' + lead.email);\n}\nif (!lead.url) {\n  throw new Error('No website URL provided');\n}\n\nreturn [{ json: lead }];"
+      },
+      "id": "node-clean",
+      "name": "3. Clean Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 380]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 4: Basic Website Pre-Audit ─────────────────────\n// Uses HTTP request to fetch the website HTML and check for key signals\n// This runs BEFORE the Claude AI step so we pass real data to Claude\n\nconst lead = $input.first().json;\nconst url = lead.url;\n\n// We'll do the actual HTTP fetch in the next HTTP node.\n// This node just prepares the audit checklist structure.\n\nconst audit = {\n  url: url,\n  hostname: lead.hostname,\n  checks: {\n    ga4: false,\n    gtm: false,\n    metaPixel: false,\n    serverSide: false,\n    hasTitle: false,\n    hasDescription: false,\n    hasH1: false,\n    hasSchema: false,\n    hasOG: false,\n    hasCanonical: false,\n    hasSitemap: false,\n    isHttps: url.startsWith('https://'),\n    hasForms: false,\n    hasSSL: url.startsWith('https://')\n  },\n  titleText: '',\n  descText: '',\n  titleLength: 0,\n  descLength: 0,\n  issuesFound: [],\n  passesFound: [],\n  score: 0\n};\n\nreturn [{ json: { lead, audit } }];"
+      },
+      "id": "node-prepare",
+      "name": "4. Prepare Audit Structure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 380]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.allorigins.win/get?url={{ encodeURIComponent($json.lead.url) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "fullResponse": false
+            }
+          }
+        }
+      },
+      "id": "node-fetch",
+      "name": "5. Fetch Website HTML",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 380],
+      "notes": "Fetches the lead's website HTML via allorigins proxy (free, no API key needed). Falls through to error handler if unreachable."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 6: Analyse HTML for Tracking & SEO Signals ─────\nconst { lead, audit } = $('4. Prepare Audit Structure').first().json;\nconst response = $input.first().json;\n\nlet html = '';\ntry {\n  const parsed = typeof response === 'string' ? JSON.parse(response) : response;\n  html = parsed.contents || parsed || '';\n} catch(e) {\n  html = String(response || '');\n}\n\nconst h = String(html);\nconst lh = h.toLowerCase();\n\nif (!h || h.length < 100) {\n  audit.fetchFailed = true;\n  audit.fetchNote = 'Could not fetch website HTML — site may block crawlers or be down.';\n  return [{ json: { lead, audit } }];\n}\n\naudit.fetchFailed = false;\n\n// ── TRACKING CHECKS ──\naudit.checks.ga4        = lh.includes('gtag') && (lh.includes('g-') || lh.includes('googletagmanager'));\naudit.checks.gtm        = lh.includes('googletagmanager.com/gtm.js') || lh.includes('gtm.js');\naudit.checks.metaPixel  = lh.includes('connect.facebook.net') || lh.includes('fbevents.js') || (lh.includes('fbq(') && lh.includes('pageview'));\naudit.checks.serverSide = lh.includes('stape') || lh.includes('sgtm') || (lh.includes('gtm') && lh.includes('server'));\n\n// ── ON-PAGE SEO ──\nconst titleMatch = h.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\naudit.titleText   = titleMatch ? titleMatch[1].replace(/<[^>]+>/g,'').trim() : '';\naudit.titleLength = audit.titleText.length;\naudit.checks.hasTitle = audit.titleLength >= 20;\n\nconst descMatch = h.match(/<meta[^>]*name=[\"']description[\"'][^>]*content=[\"']([^\"']*)/i)\n               || h.match(/<meta[^>]*content=[\"']([^\"']*)[^>]*name=[\"']description[\"']/i);\naudit.descText   = descMatch ? descMatch[1].trim() : '';\naudit.descLength = audit.descText.length;\naudit.checks.hasDescription = audit.descLength >= 50;\n\naudit.checks.hasH1        = (h.match(/<h1[\\s>]/gi) || []).length === 1;\naudit.checks.hasSchema    = lh.includes('application/ld+json') || lh.includes('itemtype=');\naudit.checks.hasOG        = lh.includes('og:title') || lh.includes('og:description');\naudit.checks.hasCanonical = lh.includes('rel=\"canonical\"') || lh.includes(\"rel='canonical'\");\naudit.checks.hasForms     = lh.includes('<form');\naudit.checks.hasViewport  = lh.includes('viewport');\n\n// ── SCORE ──\nconst weights = {\n  isHttps: 8, ga4: 10, gtm: 8, metaPixel: 8,\n  hasTitle: 8, hasDescription: 8, hasH1: 7,\n  hasSchema: 6, hasOG: 5, hasCanonical: 5,\n  hasViewport: 5, hasForms: 5\n};\nlet total = 0, max = 0;\nObject.entries(weights).forEach(([k, w]) => {\n  max += w;\n  if (audit.checks[k]) total += w;\n});\naudit.score = Math.round((total / max) * 100);\n\n// ── ISSUES & PASSES ──\naudit.issuesFound = [];\naudit.passesFound = [];\n\nif (!audit.checks.ga4)         audit.issuesFound.push('GA4 not detected — no analytics data being collected');\nif (!audit.checks.gtm)         audit.issuesFound.push('Google Tag Manager missing — conversion tracking is limited');\nif (!audit.checks.metaPixel)   audit.issuesFound.push('Meta Pixel not found — Meta/Instagram ads cannot track conversions');\nif (!audit.checks.serverSide)  audit.issuesFound.push('No server-side tracking detected — likely losing 30-50% of conversion data to ad blockers and iOS');\nif (!audit.checks.hasTitle)    audit.issuesFound.push('Page title missing or too short — major SEO impact');\nif (!audit.checks.hasDescription) audit.issuesFound.push('Meta description missing — affects CTR from Google search results');\nif (!audit.checks.hasH1)       audit.issuesFound.push('H1 heading issue — multiple or missing H1 hurts keyword rankings');\nif (!audit.checks.hasSchema)   audit.issuesFound.push('No schema markup — missing rich result eligibility in Google');\nif (!audit.checks.hasOG)       audit.issuesFound.push('No Open Graph tags — social sharing previews will look broken');\nif (!audit.checks.hasCanonical) audit.issuesFound.push('No canonical tag — risk of duplicate content penalties');\nif (!audit.checks.isHttps)     audit.issuesFound.push('Site not on HTTPS — critical security and ranking issue');\n\nif (audit.checks.ga4)          audit.passesFound.push('GA4 is active');\nif (audit.checks.gtm)          audit.passesFound.push('Google Tag Manager found');\nif (audit.checks.metaPixel)    audit.passesFound.push('Meta Pixel is firing');\nif (audit.checks.isHttps)      audit.passesFound.push('HTTPS enabled');\nif (audit.checks.hasSchema)    audit.passesFound.push('Schema markup present');\nif (audit.checks.hasOG)        audit.passesFound.push('Open Graph tags set');\n\nreturn [{ json: { lead, audit } }];"
+      },
+      "id": "node-analyse",
+      "name": "6. Analyse Tracking & SEO",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 380]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 7: Write to Google Sheets ──────────────────────\n// Prepares the row data. The actual Sheets node follows.\nconst { lead, audit } = $input.first().json;\n\nconst row = {\n  Timestamp:     lead.submitted,\n  Name:          lead.name,\n  Company:       lead.company,\n  Email:         lead.email,\n  Phone:         lead.phone || '—',\n  Website:       lead.url,\n  Challenge:     lead.challenge,\n  Score:         audit.score,\n  GA4:           audit.checks.ga4 ? 'YES' : 'NO',\n  GTM:           audit.checks.gtm ? 'YES' : 'NO',\n  MetaPixel:     audit.checks.metaPixel ? 'YES' : 'NO',\n  ServerSide:    audit.checks.serverSide ? 'YES' : 'NO',\n  Issues:        audit.issuesFound.join(' | '),\n  Passes:        audit.passesFound.join(' | '),\n  Status:        'New Lead',\n  AuditSentAt:   '',\n  Notes:         ''\n};\n\nreturn [{ json: { lead, audit, row } }];"
+      },
+      "id": "node-sheets-prep",
+      "name": "7. Prepare Sheets Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID_HERE",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp":   "={{ $json.row.Timestamp }}",
+            "Name":        "={{ $json.row.Name }}",
+            "Company":     "={{ $json.row.Company }}",
+            "Email":       "={{ $json.row.Email }}",
+            "Phone":       "={{ $json.row.Phone }}",
+            "Website":     "={{ $json.row.Website }}",
+            "Challenge":   "={{ $json.row.Challenge }}",
+            "Score":       "={{ $json.row.Score }}",
+            "GA4":         "={{ $json.row.GA4 }}",
+            "GTM":         "={{ $json.row.GTM }}",
+            "MetaPixel":   "={{ $json.row.MetaPixel }}",
+            "ServerSide":  "={{ $json.row.ServerSide }}",
+            "Issues":      "={{ $json.row.Issues }}",
+            "Passes":      "={{ $json.row.Passes }}",
+            "Status":      "={{ $json.row.Status }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "node-sheets",
+      "name": "8. Save to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [1560, 280],
+      "notes": "SETUP: Replace YOUR_GOOGLE_SHEET_ID_HERE with your Sheet ID. Create a sheet named 'Leads' with columns: Timestamp, Name, Company, Email, Phone, Website, Challenge, Score, GA4, GTM, MetaPixel, ServerSide, Issues, Passes, Status, AuditSentAt, Notes"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 9: Build Claude AI Prompt ──────────────────────\nconst { lead, audit } = $('6. Analyse Tracking & SEO').first().json;\n\nconst issuesList = audit.issuesFound.length > 0\n  ? audit.issuesFound.map((i, n) => `${n+1}. ${i}`).join('\\n')\n  : 'No major issues detected in automated scan.';\n\nconst passesList = audit.passesFound.length > 0\n  ? audit.passesFound.join(', ')\n  : 'None detected in automated scan.';\n\nconst prompt = `You are a senior digital marketing analyst at Vyom Intelligence, a specialist agency for Marketing Analytics, Conversion Tracking, and Automation.\n\nA business just submitted a free website audit request. Here is their data:\n\nName: ${lead.name}\nCompany: ${lead.company}\nWebsite: ${lead.url}\nBiggest challenge: ${lead.challenge}\nAudit score: ${audit.score}/100\n\nISSUES DETECTED (automated scan):\n${issuesList}\n\nPASSES (what's working):\n${passesList}\n\nTitle tag: ${audit.titleText || 'Not found'} (${audit.titleLength} chars)\nMeta description: ${audit.descText ? audit.descText.slice(0,80)+'...' : 'Not found'} (${audit.descLength} chars)\n\nWrite a personalised audit acknowledgement email from Vyom Intelligence to ${lead.name}.\n\nThe email must:\n1. Open with a warm, professional greeting using their first name\n2. Confirm we received their audit request for ${lead.hostname}\n3. Mention 2-3 specific issues from the scan above (make them sound alarming but not scary — use plain language, no jargon)\n4. Mention what's working (if anything) so it feels balanced\n5. Tell them they will receive the full detailed audit report within 24 hours\n6. End with a soft CTA: \"If you'd like to discuss this sooner, reply to this email or WhatsApp us at [PHONE]\"\n7. Sign off as: Sagar | Vyom Intelligence | vyomintelligence.com\n\nTone: Professional, warm, confident. Like a consultant who already knows their business.\nLength: 150-200 words maximum.\nDo NOT use buzzwords like 'leverage', 'synergy', 'holistic'.\nDo NOT use bullet points in the email — write in short paragraphs.\nOutput ONLY the email body. No subject line. No notes.`;\n\nreturn [{ json: { lead, audit, prompt } }];"
+      },
+      "id": "node-ai-prompt",
+      "name": "9. Build Claude AI Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "YOUR_ANTHROPIC_API_KEY_HERE" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-haiku-4-5-20251001\",\n  \"max_tokens\": 500,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify($json.prompt) }}\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-claude",
+      "name": "10. Claude AI — Draft Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 480],
+      "notes": "SETUP: Replace YOUR_ANTHROPIC_API_KEY_HERE with your Claude API key from console.anthropic.com. Uses claude-haiku (cheapest — ~$0.001 per lead)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 11: Extract AI Email Body ──────────────────────\nconst { lead, audit } = $('9. Build Claude AI Prompt').first().json;\nconst claudeResponse = $input.first().json;\n\nlet emailBody = '';\ntry {\n  emailBody = claudeResponse.content[0].text || '';\n} catch(e) {\n  // Fallback if Claude API fails\n  emailBody = `Hi ${lead.name},\\n\\nThank you for submitting your free website audit request for ${lead.hostname}.\\n\\nOur team has received your request and will send you a full personalised audit report within 24 hours. We have already run an initial automated scan and identified ${audit.issuesFound.length} areas to review.\\n\\nIf you would like to discuss your website sooner, simply reply to this email.\\n\\nBest regards,\\nSagar | Vyom Intelligence\\nvyomintelligence.com`;\n}\n\n// Build subject line\nconst scoreLabel = audit.score >= 75 ? 'Good baseline' : audit.score >= 50 ? 'Several gaps found' : 'Critical issues found';\nconst subject = `Your free audit for ${lead.hostname} — ${scoreLabel} (${audit.score}/100)`;\n\n// Build WhatsApp alert message\nconst waMessage = `🔔 *New Audit Lead — Vyom Intelligence*\\n\\n*Name:* ${lead.name}\\n*Company:* ${lead.company}\\n*Email:* ${lead.email}\\n*Phone:* ${lead.phone || 'Not provided'}\\n*Website:* ${lead.url}\\n*Challenge:* ${lead.challenge}\\n\\n📊 *Pre-Audit Score:* ${audit.score}/100\\n✅ *Passes:* ${audit.passesFound.join(', ') || 'None'}\\n❌ *Issues:* ${audit.issuesFound.slice(0,3).join(' | ')}\\n\\n👉 Action: Send full audit within 24hrs`;\n\nreturn [{ json: { lead, audit, emailBody, subject, waMessage } }];"
+      },
+      "id": "node-extract",
+      "name": "11. Extract AI Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 480]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.lead.email }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.emailBody }}",
+        "options": {
+          "replyTo": "hello@vyomintelligence.com",
+          "appendAttribution": false
+        }
+      },
+      "id": "node-email-lead",
+      "name": "12. Email Lead — Acknowledgement",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2000, 380],
+      "notes": "SETUP: Connect your Gmail account (hello@vyomintelligence.com) via OAuth in n8n credentials. Sends the AI-written audit acknowledgement email to the lead."
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_OWN_EMAIL@gmail.com",
+        "subject": "=🔔 New Audit Lead: {{ $json.lead.company }} — Score {{ $json.audit.score }}/100",
+        "emailType": "html",
+        "message": "=<h2>New Audit Lead — Vyom Intelligence</h2>\n<table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px'>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Name</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.lead.name }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Company</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.lead.company }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Email</td><td style='padding:8px;border-bottom:1px solid #eee'><a href='mailto:{{ $json.lead.email }}'>{{ $json.lead.email }}</a></td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Phone</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.lead.phone || '—' }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Website</td><td style='padding:8px;border-bottom:1px solid #eee'><a href='{{ $json.lead.url }}'>{{ $json.lead.url }}</a></td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Challenge</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.lead.challenge }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Score</td><td style='padding:8px;border-bottom:1px solid #eee;color:{{ $json.audit.score >= 70 ? \"#2e7d32\" : $json.audit.score >= 50 ? \"#e65100\" : \"#c62828\" }}'><strong>{{ $json.audit.score }}/100</strong></td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>GA4</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.audit.checks.ga4 ? \"✅ Detected\" : \"❌ Missing\" }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>GTM</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.audit.checks.gtm ? \"✅ Detected\" : \"❌ Missing\" }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Meta Pixel</td><td style='padding:8px;border-bottom:1px solid #eee'>{{ $json.audit.checks.metaPixel ? \"✅ Detected\" : \"❌ Missing\" }}</td></tr>\n<tr><td style='padding:8px;background:#f5f5f5;font-weight:bold'>Issues</td><td style='padding:8px'>{{ $json.audit.issuesFound.join(\" | \") }}</td></tr>\n</table>\n<br/><p style='color:#555;font-size:13px'>→ Send full audit report within 24 hours. <a href='{{ $json.lead.url }}'>Visit their site</a></p>",
+        "options": {}
+      },
+      "id": "node-email-you",
+      "name": "13. Alert You — Internal Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2000, 560],
+      "notes": "SETUP: Replace YOUR_OWN_EMAIL@gmail.com with your email. Sends you a formatted internal alert with all lead data + pre-audit results."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.telegram.org/bot{{ $vars.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $vars.TELEGRAM_CHAT_ID }}\",\n  \"text\": {{ JSON.stringify($json.waMessage) }},\n  \"parse_mode\": \"Markdown\"\n}",
+        "options": {}
+      },
+      "id": "node-telegram",
+      "name": "14. Telegram Alert (optional)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 720],
+      "notes": "OPTIONAL: Free alternative to WhatsApp. Create a Telegram bot via @BotFather (free, 1 minute). Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID as n8n variables. Delete this node if not needed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── STEP 15: 24-Hour Follow-Up Scheduler ────────────────\n// This prepares data for the follow-up. The Wait node handles the delay.\nconst { lead, audit } = $('11. Extract AI Email').first().json;\n\nreturn [{ json: {\n  lead,\n  audit,\n  followUpSubject: `Your full audit report — ${lead.hostname}`,\n  reminderNote: `REMINDER: Send full manual audit to ${lead.email} for ${lead.url}. Score was ${audit.score}/100. Issues: ${audit.issuesFound.slice(0,2).join(', ')}.`\n} }];"
+      },
+      "id": "node-followup-prep",
+      "name": "15. Prepare Follow-Up",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 480]
+    },
+    {
+      "parameters": {
+        "amount": 23,
+        "unit": "hours"
+      },
+      "id": "node-wait",
+      "name": "16. Wait 23 Hours",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [2440, 480],
+      "notes": "Pauses the workflow for 23 hours. After this, sends you a reminder to manually send the audit + sends lead a reminder email."
+    },
+    {
+      "parameters": {
+        "sendTo": "YOUR_OWN_EMAIL@gmail.com",
+        "subject": "=⏰ AUDIT DUE: {{ $json.lead.company }} — Send report now",
+        "emailType": "html",
+        "message": "=<h2>⏰ Audit Report Due — Send Now</h2>\n<p style='font-size:16px'>You promised <strong>{{ $json.lead.name }}</strong> from <strong>{{ $json.lead.company }}</strong> an audit within 24 hours.</p>\n<p><strong>Their website:</strong> <a href='{{ $json.lead.url }}'>{{ $json.lead.url }}</a></p>\n<p><strong>Their email:</strong> <a href='mailto:{{ $json.lead.email }}'>{{ $json.lead.email }}</a></p>\n<p><strong>Their challenge:</strong> {{ $json.lead.challenge }}</p>\n<p><strong>Pre-audit score:</strong> {{ $json.audit.score }}/100</p>\n<p><strong>Key issues to cover in your report:</strong></p>\n<ul>{{ $json.audit.issuesFound.map(i => '<li>' + i + '</li>').join('') }}</ul>\n<hr/>\n<p style='color:#c62828'><strong>Action required: Send their full audit report in the next 1 hour.</strong></p>",
+        "options": {}
+      },
+      "id": "node-reminder",
+      "name": "17. Remind You to Send Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2660, 380]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.lead.email }}",
+        "subject": "=Quick update on your {{ $json.lead.hostname }} audit",
+        "emailType": "text",
+        "message": "=Hi {{ $json.lead.name }},\n\nJust a quick note — your audit for {{ $json.lead.hostname }} is being finalised and will be with you very shortly.\n\nIf you have any questions in the meantime, feel free to reply to this email.\n\nBest,\nSagar | Vyom Intelligence\nvyomintelligence.com",
+        "options": {
+          "replyTo": "hello@vyomintelligence.com"
+        }
+      },
+      "id": "node-nudge",
+      "name": "18. Nudge Lead — Almost Ready",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2660, 560]
+    }
+  ],
+  "connections": {
+    "1. Webhook — Receive Lead": {
+      "main": [
+        [
+          { "node": "2. Respond to Form", "type": "main", "index": 0 },
+          { "node": "3. Clean Lead Data", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "3. Clean Lead Data": {
+      "main": [[{ "node": "4. Prepare Audit Structure", "type": "main", "index": 0 }]]
+    },
+    "4. Prepare Audit Structure": {
+      "main": [[{ "node": "5. Fetch Website HTML", "type": "main", "index": 0 }]]
+    },
+    "5. Fetch Website HTML": {
+      "main": [[{ "node": "6. Analyse Tracking & SEO", "type": "main", "index": 0 }]]
+    },
+    "6. Analyse Tracking & SEO": {
+      "main": [
+        [
+          { "node": "7. Prepare Sheets Row", "type": "main", "index": 0 },
+          { "node": "9. Build Claude AI Prompt", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "7. Prepare Sheets Row": {
+      "main": [[{ "node": "8. Save to Google Sheets", "type": "main", "index": 0 }]]
+    },
+    "9. Build Claude AI Prompt": {
+      "main": [[{ "node": "10. Claude AI — Draft Email", "type": "main", "index": 0 }]]
+    },
+    "10. Claude AI — Draft Email": {
+      "main": [[{ "node": "11. Extract AI Email", "type": "main", "index": 0 }]]
+    },
+    "11. Extract AI Email": {
+      "main": [
+        [
+          { "node": "12. Email Lead — Acknowledgement", "type": "main", "index": 0 },
+          { "node": "13. Alert You — Internal Email", "type": "main", "index": 0 },
+          { "node": "14. Telegram Alert (optional)", "type": "main", "index": 0 },
+          { "node": "15. Prepare Follow-Up", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "15. Prepare Follow-Up": {
+      "main": [[{ "node": "16. Wait 23 Hours", "type": "main", "index": 0 }]]
+    },
+    "16. Wait 23 Hours": {
+      "main": [
+        [
+          { "node": "17. Remind You to Send Report", "type": "main", "index": 0 },
+          { "node": "18. Nudge Lead — Almost Ready", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["vyom-intelligence", "lead-generation", "audit"],
+  "meta": {
+    "instanceId": "vyom-intelligence-audit-pipeline-v1",
+    "templateCredsSetupCompleted": false
+  },
+  "__SETUP_INSTRUCTIONS__": {
+    "step1_n8n": "Go to n8n.io → Sign up free (cloud) OR self-host on Railway/Render for free tier",
+    "step2_import": "In n8n: New Workflow → top-right menu → Import from JSON → paste this file",
+    "step3_webhook": "Activate the workflow → copy the webhook URL from node 1 → paste into your audit form's POST action",
+    "step4_google_sheets": "Node 8: Connect Google Sheets credential → create a Sheet named 'Leads' with the columns listed in the node notes",
+    "step5_gmail": "Nodes 12, 13, 17, 18: Connect your Gmail account via OAuth in n8n credentials",
+    "step6_claude_api": "Node 10: Get free API key from console.anthropic.com → replace YOUR_ANTHROPIC_API_KEY_HERE. First $5 credit is free — enough for ~5000 leads.",
+    "step7_telegram_optional": "Node 14: Create bot via Telegram @BotFather (free) → set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID as n8n variables → or delete this node",
+    "step8_test": "Use n8n's test webhook → send a sample POST with: name, company, email, phone, url, challenge fields → watch it run end to end",
+    "cost": "Total cost to run this: $0/month (n8n free tier: 5 active workflows, 2500 executions/month). Claude API: ~$0.001 per lead (nearly free)."
+  }
+}
